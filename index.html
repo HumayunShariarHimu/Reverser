@@ -1,0 +1,202 @@
+<!doctype html>
+
+<html lang="bn">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reverse Video (IndexedDB + ffmpeg.wasm)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,'Noto Sans Bengali',sans-serif;padding:18px;max-width:900px;margin:auto}
+    h1{font-size:20px}
+    .card{border:1px solid #e6e6e6;padding:12px;border-radius:8px;margin-bottom:12px}
+    label{display:block;margin-top:8px}
+    button{margin-right:8px;margin-top:8px}
+    video{max-width:100%;display:block;margin-top:10px}
+    pre{background:#f7f7f7;padding:8px;border-radius:6px;overflow:auto}
+    #log{white-space:pre-wrap;font-family:monospace}
+  </style>
+</head>
+<body>
+  <h1>Reverse Video — Client-side (IndexedDB + ffmpeg.wasm)</h1>
+  <p>এই টুলে আপনি আপনার নিজের ভিডিও আপলোড করে ব্রাউজারে রিভার্স (শেষ→শুরু) ভার্সন তৈরি করে প্লে করতে পারবেন। রিভার্স ভিডিও IndexedDB-তে সঞ্চিত থাকবে যাতে পরবর্তীতে লোড করা যায়।</p>  <div class="card">
+    <label>1) ভিডিও ফাইল নির্বাচন করুন (MP4/WebM)</label>
+    <input id="fileInput" type="file" accept="video/*">
+    <div>
+      <button id="processBtn" disabled>Create Reversed Video</button>
+      <button id="saveBtn" disabled>Save Original to IndexedDB</button>
+      <button id="loadReversedBtn">Load Reversed from DB</button>
+      <button id="clearDbBtn">Clear DB</button>
+    </div>
+    <label>Memory / Notes:</label>
+    <ul>
+      <li>বড় ভিডিও (৫০০MB+) এ সময় ও র‌্যাম অনেক লাগতে পারে।</li>
+      <li>ffmpeg.wasm লোড হতে কিছুক্ষন লাগবে (প্রথমবার)।</li>
+      <li>এই ডেমো pure client-side — আপনার ভিডিও সার্ভারে যায় না।</li>
+    </ul>
+  </div>  <div class="card">
+    <strong>Status / Logs</strong>
+    <div id="log"></div>
+  </div>  <div class="card">
+    <strong>Original</strong>
+    <video id="origPlayer" controls></video>
+    <strong>Reversed</strong>
+    <video id="revPlayer" controls></video>
+  </div>  <script type="module">
+  // IMPORTANT: This demo uses @ffmpeg/ffmpeg (ffmpeg.wasm).
+  // It imports from a CDN. If import fails, open console and check network.
+
+  import { createFFmpeg, fetchFile } from 'https://unpkg.com/@ffmpeg/ffmpeg@0.11.10/dist/ffmpeg.min.js';
+
+  // --- IndexedDB helpers (tiny) ---
+  function openDB(name='rev-video-db', version=1){
+    return new Promise((res, rej)=>{
+      const req = indexedDB.open(name, version);
+      req.onupgradeneeded = e => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('files')) db.createObjectStore('files');
+      }
+      req.onsuccess = e => res(e.target.result);
+      req.onerror = e => rej(e.target.error);
+    });
+  }
+  async function idbPut(key, blob){
+    const db = await openDB();
+    return new Promise((res, rej)=>{
+      const tx = db.transaction('files','readwrite');
+      tx.objectStore('files').put(blob, key);
+      tx.oncomplete = ()=>res();
+      tx.onerror = e=>rej(e.target.error);
+    });
+  }
+  async function idbGet(key){
+    const db = await openDB();
+    return new Promise((res, rej)=>{
+      const tx = db.transaction('files','readonly');
+      const r = tx.objectStore('files').get(key);
+      r.onsuccess = ()=>res(r.result);
+      r.onerror = e=>rej(e.target.error);
+    });
+  }
+  async function idbClear(){
+    const db = await openDB();
+    return new Promise((res, rej)=>{
+      const tx = db.transaction('files','readwrite');
+      tx.objectStore('files').clear();
+      tx.oncomplete = ()=>res();
+      tx.onerror = e=>rej(e.target.error);
+    });
+  }
+
+  // --- UI refs ---
+  const fileInput = document.getElementById('fileInput');
+  const processBtn = document.getElementById('processBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const loadReversedBtn = document.getElementById('loadReversedBtn');
+  const clearDbBtn = document.getElementById('clearDbBtn');
+  const logEl = document.getElementById('log');
+  const origPlayer = document.getElementById('origPlayer');
+  const revPlayer = document.getElementById('revPlayer');
+
+  let selectedFile = null;
+  let ffmpeg = null;
+  let ffmpegLoading = false;
+
+  function log(msg){
+    const ts = new Date().toLocaleTimeString();
+    logEl.textContent += `[${ts}] ${msg}\n`;
+    console.log(msg);
+  }
+
+  fileInput.addEventListener('change', e=>{
+    if (e.target.files && e.target.files[0]){
+      selectedFile = e.target.files[0];
+      const url = URL.createObjectURL(selectedFile);
+      origPlayer.src = url;
+      processBtn.disabled = false;
+      saveBtn.disabled = false;
+      log('Selected file: ' + selectedFile.name + ' (' + Math.round(selectedFile.size/1024/1024) + ' MB)');
+    }
+  });
+
+  saveBtn.addEventListener('click', async ()=>{
+    if (!selectedFile) return alert('প্রথমে ফাইল সিলেক্ট করুন');
+    log('Saving original to IndexedDB...');
+    await idbPut('original', selectedFile);
+    log('Saved original as key "original".');
+  });
+
+  clearDbBtn.addEventListener('click', async ()=>{
+    if (!confirm('Are you sure you want to clear stored files?')) return;
+    await idbClear();
+    log('IndexedDB cleared.');
+  });
+
+  loadReversedBtn.addEventListener('click', async ()=>{
+    const blob = await idbGet('reversed');
+    if (!blob){ alert('No reversed video in DB. Create one first.'); return; }
+    revPlayer.src = URL.createObjectURL(blob);
+    log('Loaded reversed video from DB.');
+  });
+
+  // --- ffmpeg init ---
+  async function ensureFFmpeg(){
+    if (ffmpeg) return ffmpeg;
+    if (ffmpegLoading) return new Promise(r=>{ const i = setInterval(()=>{ if (ffmpeg){ clearInterval(i); r(ffmpeg); } },500); });
+    ffmpegLoading = true;
+    ffmpeg = createFFmpeg({ log: true });
+    log('Loading ffmpeg.wasm (this may take a while)...');
+    await ffmpeg.load();
+    log('ffmpeg loaded.');
+    return ffmpeg;
+  }
+
+  // --- Process (reverse) ---
+  processBtn.addEventListener('click', async ()=>{
+    if (!selectedFile) return alert('ফাইল সিলেক্ট করুন');
+    processBtn.disabled = true;
+    saveBtn.disabled = true;
+    logEl.textContent = '';
+
+    try{
+      await ensureFFmpeg();
+      const name = 'input.' + (selectedFile.name.split('.').pop() || 'mp4');
+      log('Writing input file to ffmpeg FS: ' + name);
+      ffmpeg.FS('writeFile', name, await fetchFile(selectedFile));
+
+      const outName = 'output_reversed.mp4';
+      log('Running ffmpeg to reverse video & audio...');
+
+      // Reverse filter for video + audio
+      // -vf reverse and -af areverse create full reversed streams
+      await ffmpeg.run('-i', name, '-vf', 'reverse', '-af', 'areverse', outName);
+
+      log('Reading reversed file from ffmpeg FS...');
+      const data = ffmpeg.FS('readFile', outName);
+      const blob = new Blob([data.buffer], { type: 'video/mp4' });
+
+      // Save to IndexedDB and set as source
+      await idbPut('reversed', blob);
+      revPlayer.src = URL.createObjectURL(blob);
+      log('Reversed video created and saved to IndexedDB (key: "reversed").');
+
+      // cleanup ffmpeg FS
+      try{ ffmpeg.FS('unlink', name); ffmpeg.FS('unlink', outName); } catch(e){}
+
+    } catch (err){
+      console.error(err);
+      alert('Processing failed: ' + (err.message || err));
+      log('Error: ' + (err.message || err));
+    } finally{
+      processBtn.disabled = false;
+      saveBtn.disabled = false;
+    }
+  });
+
+  // On load, show if reversed already exists
+  (async ()=>{
+    const rev = await idbGet('reversed');
+    if (rev){ revPlayer.src = URL.createObjectURL(rev); log('Found reversed in DB — loaded.'); }
+  })();
+
+  </script></body>
+</html>
